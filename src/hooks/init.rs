@@ -2604,7 +2604,7 @@ const COPILOT_HOOK_JSON: &str = r#"{
 }
 "#;
 
-const COPILOT_INSTRUCTIONS: &str = r#"# RTK — Token-Optimized CLI
+const COPILOT_INSTRUCTIONS_BODY: &str = r#"# RTK — Token-Optimized CLI
 
 **rtk** is a CLI proxy that filters and compresses command outputs, saving 60-90% tokens.
 
@@ -2631,6 +2631,84 @@ rtk proxy <cmd>       # Run raw (no filtering) but track usage
 ```
 "#;
 
+fn copilot_instructions_block() -> String {
+    format!(
+        "<!-- rtk-instructions v2 -->\n{}<!-- /rtk-instructions -->\n",
+        COPILOT_INSTRUCTIONS_BODY
+    )
+}
+
+/// Older RTK installs wrote `COPILOT_INSTRUCTIONS_BODY` directly without
+/// markers. Strip that legacy text so `upsert_rtk_block` can append a properly
+/// marked block without duplicating content. Removes the first occurrence
+/// only and re-appends the marked block at end of file via the caller.
+fn strip_legacy_copilot_body(content: &str) -> Option<String> {
+    let legacy = COPILOT_INSTRUCTIONS_BODY.trim();
+    let start = content.find(legacy)?;
+    let end = start + legacy.len();
+    let before = content[..start].trim_end();
+    let after = content[end..].trim_start();
+
+    Some(match (before.is_empty(), after.is_empty()) {
+        (true, true) => String::new(),
+        (true, false) => format!("{after}\n"),
+        (false, true) => format!("{before}\n"),
+        (false, false) => format!("{before}\n\n{after}\n"),
+    })
+}
+
+fn patch_copilot_instructions(path: &Path, verbose: u8) -> Result<bool> {
+    let existing = if path.exists() {
+        fs::read_to_string(path)
+            .with_context(|| format!("Failed to read Copilot instructions: {}", path.display()))?
+    } else {
+        String::new()
+    };
+
+    let cleaned = if existing.contains("<!-- rtk-instructions") {
+        existing
+    } else if let Some(stripped) = strip_legacy_copilot_body(&existing) {
+        stripped
+    } else {
+        existing
+    };
+
+    let block = copilot_instructions_block();
+    let (mut new_content, action) = upsert_rtk_block(&cleaned, &block);
+
+    match action {
+        RtkBlockUpsert::Added | RtkBlockUpsert::Updated => {
+            if !new_content.ends_with('\n') {
+                new_content.push('\n');
+            }
+            atomic_write(path, &new_content).with_context(|| {
+                format!("Failed to write Copilot instructions: {}", path.display())
+            })?;
+            if verbose > 0 {
+                eprintln!("Updated Copilot instructions: {}", path.display());
+            }
+            Ok(true)
+        }
+        RtkBlockUpsert::Unchanged => {
+            if verbose > 0 {
+                eprintln!(
+                    "Copilot instructions already up to date: {}",
+                    path.display()
+                );
+            }
+            Ok(false)
+        }
+        RtkBlockUpsert::Malformed => {
+            eprintln!(
+                "[warn] Found '<!-- rtk-instructions' without closing marker in {}",
+                path.display()
+            );
+            eprintln!("       Leaving Copilot instructions unchanged.");
+            Ok(false)
+        }
+    }
+}
+
 /// Entry point for `rtk init --copilot`
 pub fn run_copilot(verbose: u8) -> Result<()> {
     // Install in current project's .github/ directory
@@ -2650,12 +2728,7 @@ pub fn run_copilot(verbose: u8) -> Result<()> {
 
     // 2. Write instructions
     let instructions_path = github_dir.join("copilot-instructions.md");
-    write_if_changed(
-        &instructions_path,
-        COPILOT_INSTRUCTIONS,
-        "Copilot instructions",
-        verbose,
-    )?;
+    patch_copilot_instructions(&instructions_path, verbose)?;
 
     println!("\nGitHub Copilot integration installed (project-scoped).\n");
     println!("  Hook config:    {}", hook_path.display());
@@ -2833,6 +2906,76 @@ More notes
         let (content, action) = upsert_rtk_block(input, RTK_INSTRUCTIONS);
         assert_eq!(action, RtkBlockUpsert::Malformed);
         assert_eq!(content, input);
+    }
+
+    #[test]
+    fn test_patch_copilot_instructions_preserves_user_content() {
+        let temp = TempDir::new().unwrap();
+        let github_dir = temp.path().join(".github");
+        fs::create_dir_all(&github_dir).unwrap();
+        let instructions = github_dir.join("copilot-instructions.md");
+        fs::write(&instructions, "# Team Copilot rules\n\nKeep this line.\n").unwrap();
+
+        let changed = patch_copilot_instructions(&instructions, 0).unwrap();
+        assert!(changed);
+
+        let content = fs::read_to_string(&instructions).unwrap();
+        assert!(content.contains("# Team Copilot rules"));
+        assert!(content.contains("Keep this line."));
+        assert!(content.contains("<!-- rtk-instructions v2 -->"));
+        assert!(content.contains("rtk gain"));
+
+        let changed_again = patch_copilot_instructions(&instructions, 0).unwrap();
+        assert!(!changed_again);
+        assert_eq!(fs::read_to_string(&instructions).unwrap(), content);
+    }
+
+    #[test]
+    fn test_patch_copilot_instructions_updates_existing_rtk_block() {
+        let temp = TempDir::new().unwrap();
+        let github_dir = temp.path().join(".github");
+        fs::create_dir_all(&github_dir).unwrap();
+        let instructions = github_dir.join("copilot-instructions.md");
+        fs::write(
+            &instructions,
+            "# Team rules\n\n<!-- rtk-instructions v1 -->\nold rtk text\n<!-- /rtk-instructions -->\n\nMore notes\n",
+        )
+        .unwrap();
+
+        let changed = patch_copilot_instructions(&instructions, 0).unwrap();
+        assert!(changed);
+
+        let content = fs::read_to_string(&instructions).unwrap();
+        assert!(content.contains("# Team rules"));
+        assert!(content.contains("More notes"));
+        assert!(!content.contains("old rtk text"));
+        assert!(content.contains("<!-- rtk-instructions v2 -->"));
+        assert_eq!(content.matches("<!-- rtk-instructions").count(), 1);
+    }
+
+    #[test]
+    fn test_patch_copilot_instructions_migrates_legacy_unmarked_block() {
+        let temp = TempDir::new().unwrap();
+        let github_dir = temp.path().join(".github");
+        fs::create_dir_all(&github_dir).unwrap();
+        let instructions = github_dir.join("copilot-instructions.md");
+        fs::write(
+            &instructions,
+            format!(
+                "# Team rules\n\n{}\nMore notes\n",
+                COPILOT_INSTRUCTIONS_BODY.trim()
+            ),
+        )
+        .unwrap();
+
+        let changed = patch_copilot_instructions(&instructions, 0).unwrap();
+        assert!(changed);
+
+        let content = fs::read_to_string(&instructions).unwrap();
+        assert!(content.contains("# Team rules"));
+        assert!(content.contains("More notes"));
+        assert!(content.contains("<!-- rtk-instructions v2 -->"));
+        assert_eq!(content.matches("# RTK").count(), 1);
     }
 
     #[test]
